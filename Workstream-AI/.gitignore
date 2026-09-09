@@ -1,0 +1,113 @@
+# --- General ---
+.DS_Store
+*.log
+logs/
+*.tmp
+*.bak
+*.swp
+*.swo
+Thumbs.db
+
+# --- System ---
+.vscode/
+!.vscode/extensions.json
+.idea/
+*.suo
+*.sln
+
+# --- Frontend (Vite/React) ---
+node_modules/
+dist/
+dist-ssr/
+.vite/
+frontend/node_modules/
+frontend/dist/
+frontend/test-results/
+frontend/playwright-report/
+frontend/blob-report/
+frontend/playwright/.cache/
+frontend.zip
+
+# --- Backend (Python/FastAPI) ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Environment variables
+.env*
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Build and distribution
+build/
+dist/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+*.egg
+MANIFEST
+.installed.cfg
+!frontend/src/lib/
+!frontend/src/lib/**
+
+# Testing and coverage
+.pytest_cache/
+.mypy_cache/
+.tox/
+.nox/
+.coverage
+htmlcov/
+nosetests.xml
+coverage.xml
+
+# Python version
+.python-version
+
+# Database files
+*.db
+*.sqlite3
+.env.test.local
+.env.production.local
+frontend/.env
+frontend/.env.local
+microservices/meetingworkflow/.env
+microservices/meetingworkflow/.env.local
+
+# --- Project Specific Data ---
+# Video and Audio recordings
+*.mp4
+*.webm
+*.m4a
+*.wav
+*.mp3
+
+# Backend Data Exports and Local DBs
+microservices/meetingworkflow/data/github_exports/*.json
+microservices/meetingworkflow/db/*.sqlite3
+microservices/meetingworkflow/db/*.db
+# Keep sample files, but ignore other additions if needed
+# microservices/meetingworkflow/data/sample_*.txt
+
+# Ignore specific large files or uploads if they end up here
+/uploads/
+".terraform/" 
+"*.tfstate" 
+"*.tfstate.*" 
+"terraform/.terraform.lock.hcl" 

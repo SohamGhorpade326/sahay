@@ -1,6 +1,7 @@
 'use client'
 
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import Link from 'next/link'
 import {
   Activity,
   AlertTriangle,
@@ -36,6 +37,16 @@ import {
   Zap,
 } from 'lucide-react'
 import { Card, PageFooter, SahayShell, SectionLabel } from '@/components/sahay-shell'
+import {
+  createVideoSession,
+  getVideoSession,
+  getNextVideoQuestion,
+  saveTypedAnswer,
+  startVideoInterview,
+  submitVideoSession,
+  uploadVideoAnswer,
+  type VideoQuestion,
+} from '@/lib/video-onboarding-api'
 
 const languages = [
   { code: 'mr', label: 'मराठी', name: 'Marathi' },
@@ -60,6 +71,153 @@ export default function VictimSupport() {
   ])
   const [isMeetMuted, setIsMeetMuted] = useState(false)
   const [isMeetVideoOff, setIsMeetVideoOff] = useState(false)
+  const [meetStage, setMeetStage] = useState<'ready' | 'interview' | 'complete'>('ready')
+  const [sessionId, setSessionId] = useState<string | null>(null)
+  const [currentQuestion, setCurrentQuestion] = useState<VideoQuestion | null>(null)
+  const [questionNumber, setQuestionNumber] = useState(0)
+  const [answerCount, setAnswerCount] = useState(0)
+  const [savedAnswers, setSavedAnswers] = useState<Array<{ question_text: string; audio_transcript?: string }>>([])
+  const [transcript, setTranscript] = useState('')
+  const [meetError, setMeetError] = useState('')
+  const [isStartingMeet, setIsStartingMeet] = useState(false)
+  const [isRecordingAnswer, setIsRecordingAnswer] = useState(false)
+  const [isUploadingAnswer, setIsUploadingAnswer] = useState(false)
+  const [isChatOpen, setIsChatOpen] = useState(false)
+  const [typedAnswer, setTypedAnswer] = useState('')
+  const cameraRef = useRef<HTMLVideoElement>(null)
+  const streamRef = useRef<MediaStream | null>(null)
+  const recorderRef = useRef<MediaRecorder | null>(null)
+  const chunksRef = useRef<Blob[]>([])
+  const recordingStartedRef = useRef(0)
+
+  useEffect(() => () => {
+    streamRef.current?.getTracks().forEach((track) => track.stop())
+  }, [])
+
+  useEffect(() => {
+    if (!currentQuestion || meetStage !== 'interview') return
+    const utterance = new SpeechSynthesisUtterance(currentQuestion.question_text)
+    utterance.rate = 0.9
+    utterance.lang = selectedLang === 'mr' ? 'mr-IN' : selectedLang === 'hi' ? 'hi-IN' : 'en-IN'
+    window.speechSynthesis.cancel()
+    window.speechSynthesis.speak(utterance)
+  }, [currentQuestion, meetStage, selectedLang])
+
+  useEffect(() => {
+    if (meetStage !== 'interview' || !streamRef.current || !cameraRef.current) return
+    const video = cameraRef.current
+    video.srcObject = streamRef.current
+    video.play().catch(() => setMeetError('Camera preview is blocked. Allow camera access and refresh the meet.'))
+  }, [meetStage])
+
+  const startCamera = async () => {
+    if (!navigator.mediaDevices?.getUserMedia) throw new Error('Camera and microphone access is unavailable in this browser.')
+    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+    streamRef.current = stream
+    if (cameraRef.current) {
+      cameraRef.current.srcObject = stream
+      await cameraRef.current.play()
+    }
+  }
+
+  const beginMeet = async () => {
+    try {
+      setMeetError('')
+      setIsStartingMeet(true)
+      await startCamera()
+      const created = await createVideoSession()
+      const started = await startVideoInterview(created.session_id)
+      setSessionId(created.session_id)
+      setCurrentQuestion(started.first_question)
+      setQuestionNumber(1)
+      setMeetStage('interview')
+    } catch (error) {
+      setMeetError(error instanceof Error ? error.message : 'Unable to start the secure meet.')
+      streamRef.current?.getTracks().forEach((track) => track.stop())
+      streamRef.current = null
+    } finally {
+      setIsStartingMeet(false)
+    }
+  }
+
+  const finishInterview = async () => {
+    if (!sessionId) return
+    await submitVideoSession(sessionId)
+    const completedSession = await getVideoSession(sessionId)
+    setSavedAnswers(completedSession.answers.map((answer) => ({ question_text: answer.question_text, audio_transcript: answer.audio_transcript || answer.answer_text })))
+    setMeetStage('complete')
+    streamRef.current?.getTracks().forEach((track) => track.stop())
+  }
+
+  const stopAndUploadAnswer = () => {
+    if (!recorderRef.current || recorderRef.current.state === 'inactive' || !currentQuestion || !sessionId) return
+    recorderRef.current.stop()
+    setIsRecordingAnswer(false)
+  }
+
+  const startAnswerRecording = () => {
+    if (!streamRef.current || !currentQuestion || !sessionId || isRecordingAnswer) return
+    const audioTracks = streamRef.current.getAudioTracks()
+    if (audioTracks.length === 0) {
+      setMeetError('Microphone access is required to record an answer.')
+      return
+    }
+    chunksRef.current = []
+    const recorder = MediaRecorder.isTypeSupported('audio/webm')
+      ? new MediaRecorder(new MediaStream(audioTracks), { mimeType: 'audio/webm' })
+      : new MediaRecorder(new MediaStream(audioTracks))
+    recorder.ondataavailable = (event) => event.data.size > 0 && chunksRef.current.push(event.data)
+    recorder.onstop = async () => {
+      const blob = new Blob(chunksRef.current, { type: 'audio/webm' })
+      const duration = Math.max(1, Math.round((Date.now() - recordingStartedRef.current) / 1000))
+      try {
+        setIsUploadingAnswer(true)
+        setMeetError('')
+        const result = await uploadVideoAnswer(sessionId, currentQuestion.question_id, blob, duration)
+        const next = await getNextVideoQuestion(sessionId)
+        setTranscript(result.audio_transcript || 'Answer stored securely. Transcription is processing.')
+        setAnswerCount((count) => count + 1)
+        if (!next.completed && next.next_question) {
+          setCurrentQuestion(next.next_question)
+          setQuestionNumber(next.next_question.order)
+        } else {
+          await finishInterview()
+        }
+      } catch (error) {
+        setMeetError(error instanceof Error ? error.message : 'Unable to save this answer.')
+      } finally {
+        setIsUploadingAnswer(false)
+      }
+    }
+    recorderRef.current = recorder
+    recordingStartedRef.current = Date.now()
+    recorder.start()
+    setIsRecordingAnswer(true)
+  }
+
+  const submitTypedAnswer = async () => {
+    if (!sessionId || !currentQuestion || !typedAnswer.trim() || isUploadingAnswer) return
+    try {
+      setIsUploadingAnswer(true)
+      setMeetError('')
+      await saveTypedAnswer(sessionId, currentQuestion.question_id, typedAnswer.trim())
+      const next = await getNextVideoQuestion(sessionId)
+      setTranscript(typedAnswer.trim())
+      setTypedAnswer('')
+      setIsChatOpen(false)
+      setAnswerCount((count) => count + 1)
+      if (!next.completed && next.next_question) {
+        setCurrentQuestion(next.next_question)
+        setQuestionNumber(next.next_question.order)
+      } else {
+        await finishInterview()
+      }
+    } catch (error) {
+      setMeetError(error instanceof Error ? error.message : 'Unable to save your typed answer.')
+    } finally {
+      setIsUploadingAnswer(false)
+    }
+  }
 
   const handleSendMessage = () => {
     if (!inputMsg.trim()) return
@@ -464,84 +622,53 @@ export default function VictimSupport() {
                 </div>
               </div>
 
-              {/* Video Call Grid */}
-              <div className="grid gap-4 md:grid-cols-2 mb-6">
-                {/* AI Counselor Screen */}
-                <div className="relative overflow-hidden rounded-2xl bg-gradient-to-br from-indigo-900 to-slate-900 border border-indigo-700/50 p-6 flex flex-col items-center justify-center text-center min-h-[260px]">
-                  <div className="relative flex h-24 w-24 items-center justify-center rounded-full bg-primary/20 text-primary border-2 border-primary/50 shadow-2xl animate-pulse">
-                    <Sparkles size={44} />
-                    <div className="absolute inset-0 rounded-full border border-primary animate-ping opacity-40" />
-                  </div>
-                  <h3 className="mt-4 text-base font-extrabold">SAHAY AI Counselor</h3>
-                  <p className="text-xs text-indigo-300">Empathetic Virtual Counselor · Listening in Marathi</p>
-                  
-                  {/* Live Waveform Overlay */}
-                  <div className="mt-4 flex items-center gap-1 h-6">
-                    {[16, 24, 12, 32, 20, 28, 14, 22].map((h, i) => (
-                      <span key={i} className="w-1 rounded-full bg-primary animate-pulse" style={{ height: `${h}px`, animationDelay: `${i * 0.15}s` }} />
-                    ))}
-                  </div>
-                </div>
+              {meetError && <p className="mb-4 rounded-xl border border-rose-500/40 bg-rose-500/10 p-3 text-xs text-rose-200">{meetError}</p>}
 
-                {/* Victim Video Screen */}
-                <div className="relative overflow-hidden rounded-2xl bg-slate-900 border border-slate-800 p-6 flex flex-col items-center justify-center text-center min-h-[260px]">
-                  {isMeetVideoOff ? (
-                    <div className="flex flex-col items-center justify-center">
-                      <div className="flex h-20 w-20 items-center justify-center rounded-full bg-slate-800 text-slate-400 mb-2">
-                        <UserRound size={36} />
-                      </div>
-                      <p className="text-xs text-slate-400">Camera Paused (Private Audio Mode)</p>
+              {meetStage === 'ready' && (
+                <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-8 text-center">
+                  <div className="mx-auto flex h-20 w-20 items-center justify-center rounded-full bg-primary/20 text-primary"><Video size={34} /></div>
+                  <h3 className="mt-5 text-xl font-extrabold">Start your private AI meet</h3>
+                  <p className="mx-auto mt-2 max-w-lg text-sm leading-relaxed text-slate-400">SAHAY will ask ten questions in the live video session. Your recorded answers and transcripts are stored securely for support review.</p>
+                  <button onClick={beginMeet} disabled={isStartingMeet} className="mt-6 inline-flex items-center justify-center gap-2 rounded-xl bg-primary px-6 py-3 text-sm font-extrabold text-primary-foreground disabled:opacity-50"><Video size={17} />{isStartingMeet ? 'Opening secure meet...' : 'Start private AI meet'}</button>
+                </div>
+              )}
+
+              {meetStage === 'interview' && (
+                <>
+                  <div className="mb-4 flex items-center justify-between text-xs"><span className="font-bold text-slate-300">Question {questionNumber} of 10</span><span className="text-emerald-400">{answerCount} answers saved</span></div>
+                  <div className="mb-6 h-1.5 overflow-hidden rounded-full bg-slate-800"><div className="h-full rounded-full bg-primary transition-all" style={{ width: `${(answerCount / 10) * 100}%` }} /></div>
+                  <div className="grid gap-4 md:grid-cols-2">
+                    <div className="relative min-h-[260px] overflow-hidden rounded-2xl border border-indigo-700/50 bg-gradient-to-br from-indigo-900 to-slate-900 p-6 text-center">
+                      <div className="relative mx-auto flex h-20 w-20 items-center justify-center rounded-full bg-primary/20 text-primary"><Sparkles size={38} /><div className="absolute inset-0 rounded-full border border-primary animate-ping opacity-40" /></div>
+                      <h3 className="mt-4 text-base font-extrabold">SAHAY AI Counselor</h3><p className="text-xs text-indigo-300">Listening in {languages.find((language) => language.code === selectedLang)?.name || 'English'}</p>
+                      <p className="mt-5 rounded-xl border border-primary/30 bg-slate-950/40 p-3 text-left text-sm leading-relaxed text-white">{currentQuestion?.question_text}</p>
                     </div>
-                  ) : (
-                    <div className="relative w-full h-full flex flex-col items-center justify-center">
-                      <div className="flex h-20 w-20 items-center justify-center rounded-full bg-primary/10 text-primary border border-primary/30 mb-2">
-                        <UserRound size={36} />
-                      </div>
-                      <p className="text-xs font-bold">Victim Live Screen</p>
-                      <span className="mt-1 rounded-full bg-slate-800 px-2.5 py-0.5 text-[10px] text-slate-300">
-                        Face Expression Analysis: Calm / Listening
-                      </span>
+                    <div className="relative min-h-[260px] overflow-hidden rounded-2xl border border-slate-800 bg-slate-900">
+                      {!isMeetVideoOff ? <video ref={cameraRef} muted playsInline className="h-full min-h-[260px] w-full object-cover" /> : <div className="flex min-h-[260px] flex-col items-center justify-center text-slate-400"><UserRound size={48} /><p className="mt-2 text-xs">Camera paused</p></div>}
+                      <span className="absolute bottom-3 left-3 rounded-full bg-slate-950/80 px-2.5 py-1 text-[10px] text-slate-200">Live victim video</span>
+                    </div>
+                  </div>
+                  <div className="mt-4 rounded-xl border border-slate-800 bg-slate-900/80 p-3.5 text-xs text-slate-200"><span className="font-bold text-primary">Saved caption:</span> {transcript || 'Your recorded answer will appear here after upload.'}</div>
+                  {isChatOpen && (
+                    <div className="mt-4 rounded-2xl border border-primary/40 bg-slate-900 p-4">
+                      <div className="mb-3 flex items-center justify-between"><div><p className="text-sm font-extrabold">Type your answer</p><p className="text-[11px] text-slate-400">Your response will be saved to this question.</p></div><button onClick={() => setIsChatOpen(false)} className="text-xs text-slate-400 hover:text-white">Close</button></div>
+                      <textarea value={typedAnswer} onChange={(event) => setTypedAnswer(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) submitTypedAnswer() }} rows={3} autoFocus placeholder="Write your response here..." className="w-full resize-none rounded-xl border border-slate-700 bg-slate-950 px-3 py-2.5 text-sm text-white outline-none focus:border-primary" />
+                      <button onClick={submitTypedAnswer} disabled={!typedAnswer.trim() || isUploadingAnswer} className="mt-3 w-full rounded-xl bg-primary px-4 py-2.5 text-xs font-extrabold text-primary-foreground disabled:opacity-50">{isUploadingAnswer ? 'Saving response...' : 'Save typed response'}</button>
                     </div>
                   )}
-                </div>
-              </div>
+                  <div className="mt-4 flex flex-wrap items-center justify-center gap-3 border-t border-slate-800 pt-4">
+                    <button onClick={() => setIsChatOpen((open) => !open)} disabled={isUploadingAnswer} className={`flex h-12 w-12 items-center justify-center rounded-full ${isChatOpen ? 'bg-primary text-primary-foreground' : 'bg-slate-800 text-slate-200'}`} title="Type answer instead"><MessageCircle size={20} /></button>
+                    <button onClick={() => { setIsMeetMuted((muted) => !muted); streamRef.current?.getAudioTracks().forEach((track) => { track.enabled = isMeetMuted }) }} className={`flex h-12 w-12 items-center justify-center rounded-full ${isMeetMuted ? 'bg-rose-600' : 'bg-slate-800'}`} title={isMeetMuted ? 'Unmute microphone' : 'Mute microphone'}>{isMeetMuted ? <MicOff size={20} /> : <Mic size={20} />}</button>
+                    <button onClick={() => { setIsMeetVideoOff((off) => !off); streamRef.current?.getVideoTracks().forEach((track) => { track.enabled = isMeetVideoOff }) }} className={`flex h-12 w-12 items-center justify-center rounded-full ${isMeetVideoOff ? 'bg-rose-600' : 'bg-slate-800'}`} title={isMeetVideoOff ? 'Turn video on' : 'Turn video off'}>{isMeetVideoOff ? <VideoOff size={20} /> : <Video size={20} />}</button>
+                    <button onClick={isRecordingAnswer ? stopAndUploadAnswer : startAnswerRecording} disabled={isUploadingAnswer} className={`flex items-center gap-2 rounded-full px-5 py-3 text-xs font-extrabold ${isRecordingAnswer ? 'bg-rose-600' : 'bg-primary text-primary-foreground'} disabled:opacity-50`}>{isUploadingAnswer ? 'Saving answer...' : isRecordingAnswer ? <><Pause size={16} />Finish answer</> : <><Mic size={16} />Record answer</>}</button>
+                  </div>
+                </>
+              )}
 
-              {/* Live Caption Transcript Bar */}
-              <div className="rounded-xl border border-slate-800 bg-slate-900/80 p-3.5 text-xs text-slate-200 mb-6 font-mono">
-                <span className="text-primary font-bold mr-2">Live Caption:</span>
-                &quot;SAHAY AI: मला तुमचे बोलणे ऐकून आनंद झाला. मी तुम्हाला कायदेशीर मदतीसाठी NALSA अधिकाऱ्याशी जोडत आहे...&quot;
-              </div>
+              {meetStage === 'complete' && (
+                <div className="rounded-2xl border border-emerald-500/30 bg-emerald-500/10 p-6"><Check size={42} className="mx-auto text-emerald-400" /><h3 className="mt-4 text-center text-xl font-extrabold">Your story has been securely recorded</h3><p className="mt-2 text-center text-sm text-slate-300">All ten responses are stored in the SAHAY support queue. A support officer can now review them and follow up through your safe contact.</p><div className="mt-6 space-y-2">{savedAnswers.map((answer, index) => <div key={`${answer.question_text}-${index}`} className="rounded-xl border border-slate-700 bg-slate-950/60 p-3 text-left"><p className="text-xs font-bold text-primary">{index + 1}. {answer.question_text}</p><p className="mt-1 text-xs text-slate-300">{answer.audio_transcript || 'Audio answer stored; transcription is pending.'}</p></div>)}</div><div className="mt-5 flex flex-col gap-2 sm:flex-row"><Link href="/overview" className="flex flex-1 items-center justify-center gap-2 rounded-xl bg-primary px-4 py-3 text-xs font-extrabold text-primary-foreground"><Sparkles size={15} />Open Sahay Insight Atlas</Link><button onClick={() => setAppMode('chat')} className="flex flex-1 items-center justify-center gap-2 rounded-xl border border-slate-700 px-4 py-3 text-xs font-bold text-slate-200"><MessageCircle size={15} />Return to support chat</button></div><p className="mt-4 text-center font-mono text-xs text-emerald-300">Session {sessionId}</p></div>
+              )}
 
-              {/* Call Control Action Toolbar */}
-              <div className="flex items-center justify-center gap-4 border-t border-slate-800 pt-4">
-                <button
-                  onClick={() => setIsMeetMuted(!isMeetMuted)}
-                  className={`flex h-12 w-12 items-center justify-center rounded-full transition-all ${
-                    isMeetMuted ? 'bg-rose-600 text-white' : 'bg-slate-800 text-slate-200 hover:bg-slate-700'
-                  }`}
-                  title={isMeetMuted ? 'Unmute Mic' : 'Mute Mic'}
-                >
-                  {isMeetMuted ? <MicOff size={20} /> : <Mic size={20} />}
-                </button>
-
-                <button
-                  onClick={() => setIsMeetVideoOff(!isMeetVideoOff)}
-                  className={`flex h-12 w-12 items-center justify-center rounded-full transition-all ${
-                    isMeetVideoOff ? 'bg-rose-600 text-white' : 'bg-slate-800 text-slate-200 hover:bg-slate-700'
-                  }`}
-                  title={isMeetVideoOff ? 'Turn Video On' : 'Turn Video Off'}
-                >
-                  {isMeetVideoOff ? <VideoOff size={20} /> : <Video size={20} />}
-                </button>
-
-                <button
-                  onClick={() => setAppMode('chat')}
-                  className="flex h-12 w-14 items-center justify-center rounded-full bg-rose-600 text-white hover:bg-rose-700 transition-all shadow-lg shadow-rose-600/30"
-                  title="End Session"
-                >
-                  <PhoneOff size={22} />
-                </button>
-              </div>
             </Card>
           )}
         </div>

@@ -16,7 +16,7 @@ import {
 import { ThemeToggle } from './theme-toggle'
 
 const links: [string, string][] = [
-  ['/overview', 'System Overview'],
+  ['/overview', 'Insight Atlas'],
   ['/victim-support', 'Sahay'],
   ['/distress-score', 'Aashwas'],
   ['/safe-check', 'Raksha'],
